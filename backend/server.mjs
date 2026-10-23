@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import { mountTasks } from './tasks.mjs';
+import { mountWave60c } from './wave60c.mjs';
 import bcrypt from 'bcryptjs';
 import express from 'express';
 import helmet from 'helmet';
@@ -9,7 +11,7 @@ import { mountRecoveryRecordActions } from './recoveryRecords.mjs';
 
 const config=(await import('../app.config.mjs')).default;
 const pool=new pg.Pool({connectionString:process.env.DATABASE_URL});
-const secret=process.env.SESSION_SECRET||'local-domain-recovery-session-change-before-production';
+const secret=process.env.SESSION_SECRET;if(!secret||secret.length<32||/demo|change.before.production/i.test(secret))throw new Error('Configure SESSION_SECRET with at least 32 random characters');
 const app=express();
 app.use(helmet({contentSecurityPolicy:false}));
 app.use(express.json({limit:'2mb'}));
@@ -59,8 +61,10 @@ async function audit(actor,action,type,reference,detail){await pool.query('INSER
 function auth(req,res,next){const token=String(req.headers.authorization||'').match(/^Bearer (.+)$/)?.[1];if(!token)return res.status(401).json({error:'Authentication required'});try{req.user=jwt.verify(token,secret);next();}catch{return res.status(401).json({error:'Session expired. Sign in again.'});}}
 
 mountRecoveryRecordActions(app,{pool,auth,featureById,accountScoped:false,dependencies:[]});
+mountTasks(app, { pool, audit, auth });
+  mountWave60c(app, { pool, auth, featureById, featureScoped: true });
 app.get('/api/health',async(_req,res)=>{try{await pool.query('SELECT 1');res.json({status:'ok',id:config.id,title:config.title,database:'postgresql',ai:aiStatus()});}catch{res.status(503).json({status:'error',error:'PostgreSQL unavailable'});}});
-app.get('/api/auth/demo-credentials',async(_req,res)=>{const password=process.env.DEMO_PASSWORD||'LocalDemo!2026';const rows=(await pool.query("SELECT email,name,role FROM app_users ORDER BY CASE role WHEN 'admin' THEN 1 WHEN 'operator' THEN 2 ELSE 3 END")).rows;res.json({email:rows[0]?.email,password,accounts:rows.map(x=>({...x,password}))});});
+app.get('/api/auth/demo-credentials',(_req,res)=>res.status(404).json({error:'Credential discovery is disabled'}));
 app.post('/api/auth/login',async(req,res)=>{const email=String(req.body.email||'').trim().toLowerCase();const row=(await pool.query('SELECT * FROM app_users WHERE lower(email)=$1',[email])).rows[0];if(!row||!await bcrypt.compare(String(req.body.password||''),row.password_hash))return res.status(401).json({error:'Invalid credentials'});const user={id:row.id,email:row.email,name:row.name,role:row.role};res.json({token:jwt.sign(user,secret,{expiresIn:'12h'}),user});});
 app.get('/api/app',auth,(req,res)=>res.json({...config,user:req.user,ai:aiStatus()}));
 app.get('/api/dashboard',auth,async(_req,res)=>{const totals=(await pool.query(`SELECT count(*)::int records,coalesce(sum(amount),0)::float value,count(*) FILTER(WHERE status NOT IN ('Approved','Closed'))::int attention FROM feature_records`)).rows[0];const features=(await pool.query(`SELECT feature_id,count(*)::int records,coalesce(sum(amount),0)::float value,count(*) FILTER(WHERE risk IN ('High','Critical'))::int high_risk FROM feature_records GROUP BY feature_id`)).rows;res.json({totals,features:config.features.map(f=>({...f,...features.find(x=>x.feature_id===f.id)}))});});
